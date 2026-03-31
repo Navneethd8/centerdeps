@@ -1,0 +1,16 @@
+name = "depscan-oauth-proxy"
+main = "oauth-proxy.js"
+compatibility_date = "2024-03-31"
+
+# ═══════════════════════════════════════════════════════════
+# DepScan OAuth Proxy Configuration
+# ═══════════════════════════════════════════════════════════
+
+# Add your non-secret environment variables here
+[vars]
+# IMPORTANT: Before deploying, change this to your GitHub pages URL or '*' for testing
+ALLOWED_ORIGIN = "https://Navneethd8.github.io"
+
+
+# Note: Add the Client Secret securely using the Wrangler CLI:
+# npx wrangler secret put GITHUB_CLIENT_SECRET

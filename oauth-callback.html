@@ -34,9 +34,9 @@
       stroke-width: 4;
       stroke-linecap: round;
     }
-    .spinner .track { stroke: rgba(139, 92, 246, 0.15); }
+    .spinner .track { stroke: rgba(148, 163, 184, 0.25); }
     .spinner .arc {
-      stroke: url(#cb-grad);
+      stroke: #06b6d4;
       stroke-dasharray: 80 60;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -61,12 +61,6 @@
 <body>
   <div class="callback-card">
     <svg class="spinner" viewBox="0 0 48 48" id="loading-spinner">
-      <defs>
-        <linearGradient id="cb-grad" x1="0" y1="0" x2="48" y2="48">
-          <stop offset="0%" stop-color="#06b6d4"/>
-          <stop offset="100%" stop-color="#8b5cf6"/>
-        </linearGradient>
-      </defs>
       <circle class="track" cx="24" cy="24" r="20"/>
       <circle class="arc" cx="24" cy="24" r="20"/>
     </svg>
@@ -95,6 +89,11 @@
 
         // Validate state param (CSRF protection)
         if (!code) {
+          const errorParam = params.get('error');
+          const errorDesc = params.get('error_description');
+          if (errorParam) {
+            return showError(`GitHub Error: ${errorDesc || errorParam}`);
+          }
           return showError('No authorization code received from GitHub.');
         }
         if (!returnedState || returnedState !== storedState) {
@@ -106,7 +105,7 @@
 
         // ── Configuration ──────────────────────────
         // These must match the values in app.js
-        const OAUTH_PROXY_URL = 'YOUR_WORKER_URL';
+        const OAUTH_PROXY_URL = 'https://depscan-oauth-proxy.depscan.workers.dev';
         // ───────────────────────────────────────────
 
         msgEl.textContent = 'Exchanging code for access token…';

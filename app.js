@@ -9,9 +9,9 @@ const DepScan = (() => {
   // ── Configuration ─────────────────────────────────────────
   // Replace these with your actual values after setup
   const CONFIG = {
-    GITHUB_CLIENT_ID:  'YOUR_GITHUB_CLIENT_ID',    // ← from GitHub OAuth App
-    OAUTH_PROXY_URL:   'YOUR_WORKER_URL',           // ← e.g. https://oauth-proxy.xxx.workers.dev
-    REDIRECT_URI:      window.location.origin + '/oauth-callback.html',
+    GITHUB_CLIENT_ID:  'Ov23liI69gmAgv5aZktQ',    // ← from GitHub OAuth App
+    OAUTH_PROXY_URL:   'https://depscan-oauth-proxy.depscan.workers.dev', // ← the Cloudflare Worker you just deployed
+    REDIRECT_URI:      window.location.href.split('?')[0].replace(/\/?(index\.html)?$/, '') + '/oauth-callback.html',
     SCOPES:            'repo read:org',
     CACHE_TTL_MS:      60 * 60 * 1000,              // 1 hour
     API_BASE:          'https://api.github.com',
@@ -100,11 +100,19 @@ const DepScan = (() => {
       ]);
 
       state.orgs = orgs || [];
+      
+      // Initialize enabledOrgs to all orgs on the first scan run
+      if (state.enabledOrgs.size === 0) {
+        for (const org of state.orgs) {
+          state.enabledOrgs.add(org.login);
+        }
+      }
+
       state.repos = [...userRepos];
 
-      // Fetch org repos
+      // Fetch org repos (only for currently enabled orgs)
       for (const org of state.orgs) {
-        state.enabledOrgs.add(org.login);
+        if (!state.enabledOrgs.has(org.login)) continue;
         try {
           const orgRepos = await fetchAllPages(`/orgs/${org.login}/repos?per_page=100`);
           state.repos.push(...orgRepos);
@@ -113,16 +121,33 @@ const DepScan = (() => {
         }
       }
 
-      // Deduplicate repos by id
+      // Deduplicate repos by id AND filter out disabled orgs that came from /user/repos
       const seen = new Set();
       state.repos = state.repos.filter(r => {
         if (seen.has(r.id)) return false;
+
+        // Skip organization repositories if that organization is disabled in settings
+        if (r.owner.type === 'Organization' && !state.enabledOrgs.has(r.owner.login)) {
+           return false;
+        }
+
         seen.add(r.id);
         return true;
       });
 
-      // Collect owners
-      state.repos.forEach(r => state.owners.add(r.owner.login));
+      // Collect owners and pre-seed the repoIndex so that expected 'total repos scanned' matches actual repos attempting to scan
+      state.repos.forEach(repo => {
+        state.owners.add(repo.owner.login);
+        
+        // Seed an empty entry so 'Repos Scanned' stat counts repos even if their SBOM fetch fails (e.g. 404 Dependency graph disabled)
+        state.repoIndex.set(repo.full_name, {
+          full_name: repo.full_name,
+          visibility: repo.private ? 'private' : 'public',
+          owner: repo.owner.login,
+          html_url: repo.html_url,
+          packages: []
+        });
+      });
 
       const total = state.repos.length;
       updateScanUI(`Scanning ${total} repositories…`, 'Fetching dependency data (SBOMs)');
@@ -224,7 +249,7 @@ const DepScan = (() => {
     const packages = (data.sbom?.packages || [])
       .filter(p => p.SPDXID !== 'SPDXRef-DOCUMENT' && p.name)
       .map(p => {
-        const { name, ecosystem } = parsePackageName(p.name);
+        const { name, ecosystem } = parsePackageInfo(p);
         return {
           name,
           version: p.versionInfo || 'unknown',
@@ -245,16 +270,34 @@ const DepScan = (() => {
     return packages;
   }
 
-  function parsePackageName(rawName) {
-    // SPDX format: "npm:axios" or "pip:requests" or "actions:github/checkout"
-    const colonIdx = rawName.indexOf(':');
-    if (colonIdx > 0) {
-      return {
-        ecosystem: rawName.substring(0, colonIdx).toLowerCase(),
-        name: rawName.substring(colonIdx + 1),
-      };
+  function parsePackageInfo(pkg) {
+    let ecosystem = null;
+    let name = pkg.name || 'unknown';
+
+    // Try to extract ecosystem from PURL in externalRefs (e.g., pkg:pypi/requests)
+    if (pkg.externalRefs) {
+      const purlRef = pkg.externalRefs.find(r => r.referenceType === 'purl');
+      if (purlRef && purlRef.referenceLocator) {
+        const match = purlRef.referenceLocator.match(/^pkg:([^\/]+)\//);
+        if (match) {
+          ecosystem = match[1].toLowerCase();
+        }
+      }
     }
-    return { ecosystem: 'other', name: rawName };
+
+    // SPDX legacy format check or name cleanup: "npm:axios" or "pip:requests"
+    const colonIdx = name.indexOf(':');
+    if (colonIdx > 0) {
+      if (!ecosystem) {
+        ecosystem = name.substring(0, colonIdx).toLowerCase();
+      }
+      name = name.substring(colonIdx + 1);
+    }
+    
+    return { 
+      ecosystem: ecosystem || 'other', 
+      name 
+    };
   }
 
   function indexPackages(repo, packages) {
@@ -422,14 +465,6 @@ const DepScan = (() => {
     state.index.forEach(entries => totalPkgs += entries.length);
     document.getElementById('stat-packages').textContent = state.index.size;
     document.getElementById('stat-ecosystems').textContent = state.ecosystems.size;
-
-    // Count drifts
-    let drifts = 0;
-    state.index.forEach((entries) => {
-      const versions = new Set(entries.map(e => e.version).filter(v => v !== 'unknown'));
-      if (versions.size > 1) drifts++;
-    });
-    document.getElementById('stat-drift').textContent = drifts;
   }
 
   function renderResults() {
@@ -448,29 +483,41 @@ const DepScan = (() => {
     let results = [];
 
     state.index.forEach((entries, pkgName) => {
-      // Search filter
-      if (query && !pkgName.toLowerCase().includes(query)) return;
+      // Find out if the package itself matches the query
+      const packageMatches = !query || pkgName.toLowerCase().includes(query);
 
-      // Filter entries by ecosystem, visibility, and owner
-      let filtered = entries;
-      if (filterEco) filtered = filtered.filter(e => e.ecosystem === filterEco);
-      if (filterVis) filtered = filtered.filter(e => e.visibility === filterVis);
-      if (filterOwner) filtered = filtered.filter(e => e.owner === filterOwner);
+      // Group by version
+      const versionGroups = {};
+      entries.forEach(e => {
+        const v = e.version || 'unknown';
+        if (!versionGroups[v]) versionGroups[v] = [];
+        versionGroups[v].push(e);
+      });
 
-      if (filtered.length === 0) return;
+      Object.entries(versionGroups).forEach(([version, verEntries]) => {
+        // Filter entries by repository (if package didn't match), ecosystem, visibility, and owner
+        let filtered = verEntries;
 
-      // Get unique versions and ecosystems from filtered entries
-      const versions = [...new Set(filtered.map(e => e.version))];
-      const ecosystems = [...new Set(filtered.map(e => e.ecosystem))];
-      const hasDrift = versions.filter(v => v !== 'unknown').length > 1;
+        if (query && !packageMatches) {
+          filtered = filtered.filter(e => e.repo.toLowerCase().includes(query));
+        }
 
-      results.push({
-        name: pkgName,
-        entries: filtered,
-        versions,
-        ecosystems,
-        hasDrift,
-        repoCount: filtered.length,
+        if (filterEco) filtered = filtered.filter(e => e.ecosystem === filterEco);
+        if (filterVis) filtered = filtered.filter(e => e.visibility === filterVis);
+        if (filterOwner) filtered = filtered.filter(e => e.owner === filterOwner);
+
+        if (filtered.length === 0) return;
+
+        const ecosystems = [...new Set(filtered.map(e => e.ecosystem))];
+
+        results.push({
+          name: pkgName,
+          version: version,
+          entries: filtered,
+          ecosystems,
+          repoCount: filtered.length,
+          rowKey: pkgName + '@' + version
+        });
       });
     });
 
@@ -479,7 +526,11 @@ const DepScan = (() => {
       switch (sortBy) {
         case 'repos': return b.repoCount - a.repoCount;
         case 'ecosystem': return (a.ecosystems[0] || '').localeCompare(b.ecosystems[0] || '');
-        default: return a.name.localeCompare(b.name);
+        default: {
+          const nameCmp = a.name.localeCompare(b.name);
+          if (nameCmp !== 0) return nameCmp;
+          return a.version.localeCompare(b.version);
+        }
       }
     });
 
@@ -502,25 +553,14 @@ const DepScan = (() => {
     const renderLimit = 200;
     results.slice(0, renderLimit).forEach(pkg => {
       const tr = document.createElement('tr');
-      tr.dataset.pkg = pkg.name;
+      tr.dataset.pkg = pkg.rowKey;
       tr.addEventListener('click', () => toggleExpand(pkg));
 
       tr.innerHTML = `
         <td><span class="pkg-name">${escHtml(pkg.name)}</span></td>
         <td class="td-eco">${pkg.ecosystems.map(e => `<span class="eco-badge" data-eco="${escAttr(e)}">${escHtml(e)}</span>`).join(' ')}</td>
         <td><span class="repo-count">${pkg.repoCount}</span></td>
-        <td>
-          <div class="version-list">
-            ${pkg.versions.slice(0, 5).map(v => `<span class="version-pill">${escHtml(v)}</span>`).join('')}
-            ${pkg.versions.length > 5 ? `<span class="version-pill">+${pkg.versions.length - 5}</span>` : ''}
-          </div>
-        </td>
-        <td class="td-drift">
-          ${pkg.hasDrift
-            ? `<span class="drift-warn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> Drift</span>`
-            : `<span class="drift-ok"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> OK</span>`
-          }
-        </td>
+        <td><span class="version-pill">${escHtml(pkg.version)}</span></td>
       `;
       tbody.appendChild(tr);
     });
@@ -537,7 +577,7 @@ const DepScan = (() => {
     const existingExpanded = tbody.querySelector('.expanded-row');
 
     // Close if same row
-    if (existingExpanded && existingExpanded.dataset.pkg === pkg.name) {
+    if (existingExpanded && existingExpanded.dataset.pkg === pkg.rowKey) {
       existingExpanded.remove();
       state.expandedRow = null;
       return;
@@ -547,15 +587,15 @@ const DepScan = (() => {
     if (existingExpanded) existingExpanded.remove();
 
     // Find the clicked row
-    const clickedRow = tbody.querySelector(`tr[data-pkg="${CSS.escape(pkg.name)}"]`);
+    const clickedRow = tbody.querySelector(`tr[data-pkg="${CSS.escape(pkg.rowKey)}"]`);
     if (!clickedRow) return;
 
     // Create expanded row
     const expRow = document.createElement('tr');
     expRow.className = 'expanded-row';
-    expRow.dataset.pkg = pkg.name;
+    expRow.dataset.pkg = pkg.rowKey;
     const td = document.createElement('td');
-    td.colSpan = 5;
+    td.colSpan = 4;
 
     td.innerHTML = `
       <div class="expanded-content">
@@ -578,7 +618,13 @@ const DepScan = (() => {
                 <td><span class="eco-badge" data-eco="${escAttr(e.ecosystem)}">${escHtml(e.ecosystem)}</span></td>
                 <td><span class="version-pill">${escHtml(e.version)}</span></td>
                 <td>${e.visibility === 'private' ? '🔒 Private' : '🌐 Public'}</td>
-                <td><a href="${escAttr(e.html_url)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Open on GitHub ↗</a></td>
+                <td>
+                  <a href="${escAttr(e.html_url)}" class="gh-link-icon" target="_blank" rel="noopener" onclick="event.stopPropagation()">
+                    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+                    </svg>
+                  </a>
+                </td>
               </tr>
             `).join('')}
           </tbody>
@@ -603,9 +649,10 @@ const DepScan = (() => {
     // Links
     const linksEl = document.getElementById('repo-panel-links');
     linksEl.innerHTML = `
-      <a class="panel-link" href="${escAttr(repoData.html_url)}" target="_blank" rel="noopener">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-        Repository
+      <a class="panel-link panel-link-icon" href="${escAttr(repoData.html_url)}" target="_blank" rel="noopener" title="Open repository on GitHub">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+          <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
+        </svg>
       </a>
       <a class="panel-link" href="${escAttr(repoData.html_url)}/network/dependencies" target="_blank" rel="noopener">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M6 9v12"/></svg>

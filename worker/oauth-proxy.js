@@ -14,21 +14,38 @@
 
 export default {
   async fetch(request, env) {
-    const origin = env.ALLOWED_ORIGIN || '*';
+    const requestOrigin = request.headers.get('Origin') || '';
 
     // ── CORS Headers ───────────────────────────────────────
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': origin,
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '86400',
-    };
+    function buildCorsHeaders() {
+      let allowOrigin = '*';
+
+      if (requestOrigin) {
+        const allowedOrigin = env.ALLOWED_ORIGIN || '';
+        const isLocalhost =
+          requestOrigin.startsWith('http://localhost') ||
+          requestOrigin.startsWith('http://127.0.0.1');
+
+        if (allowedOrigin && requestOrigin === allowedOrigin) {
+          allowOrigin = requestOrigin;
+        } else if (isLocalhost) {
+          allowOrigin = requestOrigin;
+        }
+      }
+
+      return {
+        'Access-Control-Allow-Origin': allowOrigin,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Max-Age': '86400',
+      };
+    }
 
     // ── Preflight ──────────────────────────────────────────
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
-        headers: corsHeaders,
+        headers: buildCorsHeaders(),
       });
     }
 
@@ -39,7 +56,7 @@ export default {
         JSON.stringify({ error: 'Not Found. Use POST /exchange' }),
         {
           status: 404,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
         }
       );
     }
@@ -53,7 +70,7 @@ export default {
         JSON.stringify({ error: 'Invalid JSON body' }),
         {
           status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
         }
       );
     }
@@ -64,7 +81,7 @@ export default {
         JSON.stringify({ error: 'Missing "code" in request body' }),
         {
           status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
         }
       );
     }
@@ -95,7 +112,7 @@ export default {
           }),
           {
             status: 400,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
           }
         );
       }
@@ -105,7 +122,7 @@ export default {
         JSON.stringify({ access_token: tokenData.access_token }),
         {
           status: 200,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
         }
       );
     } catch (err) {
@@ -113,7 +130,7 @@ export default {
         JSON.stringify({ error: 'Failed to exchange code with GitHub', detail: err.message }),
         {
           status: 502,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...buildCorsHeaders(), 'Content-Type': 'application/json' },
         }
       );
     }
