@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DepScan — Authenticating…</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #06080d;
+      color: #e8ecf4;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      text-align: center;
+      padding: 24px;
+    }
+    .callback-card {
+      max-width: 420px;
+    }
+    .spinner {
+      width: 48px;
+      height: 48px;
+      margin: 0 auto 24px;
+      animation: spin 1s linear infinite;
+    }
+    .spinner circle {
+      fill: none;
+      stroke-width: 4;
+      stroke-linecap: round;
+    }
+    .spinner .track { stroke: rgba(139, 92, 246, 0.15); }
+    .spinner .arc {
+      stroke: url(#cb-grad);
+      stroke-dasharray: 80 60;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h2 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    p {
+      font-size: 0.9rem;
+      color: #8892a6;
+      line-height: 1.5;
+    }
+    .error { color: #ef4444; }
+    a {
+      color: #06b6d4;
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="callback-card">
+    <svg class="spinner" viewBox="0 0 48 48" id="loading-spinner">
+      <defs>
+        <linearGradient id="cb-grad" x1="0" y1="0" x2="48" y2="48">
+          <stop offset="0%" stop-color="#06b6d4"/>
+          <stop offset="100%" stop-color="#8b5cf6"/>
+        </linearGradient>
+      </defs>
+      <circle class="track" cx="24" cy="24" r="20"/>
+      <circle class="arc" cx="24" cy="24" r="20"/>
+    </svg>
+    <h2 id="cb-title">Authenticating…</h2>
+    <p id="cb-message">Exchanging authorization code with GitHub.</p>
+  </div>
+
+  <script>
+    (async function handleCallback() {
+      const titleEl  = document.getElementById('cb-title');
+      const msgEl    = document.getElementById('cb-message');
+      const spinner  = document.getElementById('loading-spinner');
+
+      function showError(msg) {
+        spinner.style.display = 'none';
+        titleEl.textContent = 'Authentication Failed';
+        titleEl.classList.add('error');
+        msgEl.innerHTML = msg + '<br><br><a href="index.html">← Back to DepScan</a>';
+      }
+
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const code  = params.get('code');
+        const returnedState = params.get('state');
+        const storedState   = sessionStorage.getItem('oauth_state');
+
+        // Validate state param (CSRF protection)
+        if (!code) {
+          return showError('No authorization code received from GitHub.');
+        }
+        if (!returnedState || returnedState !== storedState) {
+          return showError('State parameter mismatch — possible CSRF attack. Please try again.');
+        }
+
+        // Clean up state
+        sessionStorage.removeItem('oauth_state');
+
+        // ── Configuration ──────────────────────────
+        // These must match the values in app.js
+        const OAUTH_PROXY_URL = 'YOUR_WORKER_URL';
+        // ───────────────────────────────────────────
+
+        msgEl.textContent = 'Exchanging code for access token…';
+
+        const response = await fetch(OAUTH_PROXY_URL + '/exchange', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code }),
+        });
+
+        if (!response.ok) {
+          return showError(`Token exchange failed (HTTP ${response.status}). Check your Cloudflare Worker deployment.`);
+        }
+
+        const data = await response.json();
+
+        if (!data.access_token) {
+          return showError('No access token returned. The OAuth code may have expired — <a href="index.html">try again</a>.');
+        }
+
+        // Store token in sessionStorage
+        sessionStorage.setItem('gh_token', data.access_token);
+
+        titleEl.textContent = 'Success!';
+        msgEl.textContent = 'Redirecting to DepScan…';
+
+        // Redirect back to main app
+        setTimeout(() => {
+          window.location.href = 'index.html';
+        }, 500);
+
+      } catch (err) {
+        showError('Network error: ' + err.message + '. Make sure your Cloudflare Worker is deployed and accessible.');
+      }
+    })();
+  </script>
+</body>
+</html>
